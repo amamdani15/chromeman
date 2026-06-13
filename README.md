@@ -115,30 +115,145 @@ Output names are tied to the **physical GPU port** the cable is plugged into, no
 
 ### Forcing a resolution (`chromeman lock-resolutions`)
 
-Some monitors — especially ones behind converters/switchers (e.g. Blackmagic Design HDMI boxes) — report a misleading **EDID-"preferred" mode** (often `1920x1080`) even though they support 4K. X applies that preferred mode at every boot or hotplug, which can silently downgrade a display you'd manually set to 4K, and can also shrink the X virtual screen so other outputs can no longer be resized either.
+#### Why this exists
 
-If you want specific outputs forced to a specific resolution regardless of what their EDID prefers, add a `DISPLAY_N_MODE` to your config:
+Some monitors — especially ones behind converters/switchers (e.g. Blackmagic Design HDMI boxes) — report a misleading **EDID-"preferred" mode** (often `1920x1080`) even though they support 4K. GNOME/mutter applies that preferred mode at every login, boot, or hotplug, which can silently downgrade a display you'd manually set to 4K. It can also shrink the X **virtual screen** size so other outputs can't be resized either, causing `xrandr`/`nvidia-settings` to fail with `BadMatch (RRSetScreenSize)`.
+
+`chromeman lock-resolutions` + the automatic `apply_modes` step (run by `chromeman start`/`watch`) fix this in two parts:
+
+1. **`lock-resolutions`** (one-time, manual, needs reboot) — raises the X virtual screen size *ceiling* by writing `Option "metamodes"` + `Virtual W H` into `/etc/X11/xorg.conf`, so the resolutions you want are actually possible.
+2. **`apply_modes`** (automatic, every `start`/`restart`/watchdog cycle) — runs `xrandr` to re-apply your chosen resolutions and positions, since GNOME/mutter will otherwise reset them to EDID-preferred on every login.
+
+You need **both**. `lock-resolutions` alone doesn't make the resolution stick (mutter overrides it after login); `apply_modes` alone can't exceed whatever virtual screen size X already has (hence `BadMatch`).
+
+#### Before running it for the first time
+
+1. **Confirm `/etc/X11/xorg.conf` exists and uses the `nvidia` driver:**
+   ```bash
+   cat /etc/X11/xorg.conf
+   ```
+   If the file doesn't exist, generate one first, then reboot before continuing:
+   ```bash
+   sudo nvidia-xconfig
+   sudo reboot
+   ```
+   (`lock-resolutions` edits this file's `Screen` section — it does **not** create it from scratch.)
+
+2. **Figure out which outputs need forcing, and to what resolution.** Run:
+   ```bash
+   chromeman outputs       # currently active monitors + their geometry
+   chromeman connectors    # all connectors, connected or not
+   DISPLAY=:0 xrandr --query
+   ```
+   In the `xrandr --query` mode list for each output, `*` marks the *current* mode and `+` marks the EDID-*preferred* mode. If the mode you want (e.g. `3840x2160`) is listed but not marked `+`, that's the mismatch this feature fixes. If the mode you want isn't listed at all, the display/cable genuinely can't do it — `lock-resolutions` can't add modes the hardware doesn't report.
+
+3. **Plan the layout.** `lock-resolutions` and `apply_modes` tile every output that has a `DISPLAY_N_MODE` set **left-to-right at `y=0`, in the order the `DISPLAY_N` blocks appear in your config** — e.g. two `3840x2160` outputs become a `7680x2160` canvas with the first at `+0+0` and the second at `+3840+0`. Outputs *without* a `DISPLAY_N_MODE` are left out of this layout entirely (left to normal auto-configuration), so don't mix a forced output and an unforced output that need to sit side-by-side — give both a `DISPLAY_N_MODE` if their relative position matters.
+
+4. **Make sure you can recover if something goes wrong after reboot.** `lock-resolutions` backs up `/etc/X11/xorg.conf` automatically (to `/etc/X11/xorg.conf.bak.<timestamp>`), but a bad `xorg.conf` can still leave you with a black screen or failure to start X. Make sure you have either:
+   - physical/console access to the machine, or
+   - SSH access so you can restore the backup and reboot remotely:
+     ```bash
+     sudo cp /etc/X11/xorg.conf.bak.<timestamp> /etc/X11/xorg.conf
+     sudo reboot
+     ```
+
+#### Configuring `DISPLAY_N_MODE`
+
+Add an optional `DISPLAY_N_MODE=WIDTHxHEIGHT` line to any display block in `chrome-displays.conf`:
 
 ```ini
 DISPLAY_1_OUTPUT=DP-1
+DISPLAY_1_URL=https://example.com
+DISPLAY_1_PROFILE=chrome-kiosk-1
+DISPLAY_1_AUDIO_SINK=alsa_output.pci-0000_01_00.1.pro-output-3
 DISPLAY_1_MODE=3840x2160
-...
+
 DISPLAY_2_OUTPUT=DP-3
+DISPLAY_2_URL=https://example2.com
+DISPLAY_2_PROFILE=chrome-kiosk-2
+DISPLAY_2_AUDIO_SINK=alsa_output.pci-0000_01_00.1.pro-output-7
 DISPLAY_2_MODE=3840x2160
 ```
 
-Then run:
+Rules:
+- **Format** is `WIDTHxHEIGHT` (e.g. `3840x2160`, `1920x1080`) — no refresh rate, no quotes.
+- **Optional per display** — omit it for any output whose EDID-preferred mode is already correct (e.g. a genuine 1080p monitor).
+- The **mode must be one xrandr already lists** for that output (check with `DISPLAY=:0 xrandr --query`); `lock-resolutions`/`apply_modes` can't invent unsupported modes.
+- Position is **not configurable** — it's derived automatically from tiling order (see step 3 above). If you need a different arrangement (e.g. stacked instead of side-by-side), that's not currently supported by this command.
+
+#### Running it
 
 ```bash
 chromeman lock-resolutions
+```
+
+This prints the computed layout (per-display mode + the resulting `metamodes`/`Virtual` strings) and asks for confirmation before touching anything:
+
+```
+[INFO]  Computed layout (tiled left-to-right in config order):
+    Display 1: DP-1 → 3840x2160
+    Display 2: DP-3 → 3840x2160
+
+    metamodes: DP-1: 3840x2160 +0+0, DP-3: 3840x2160 +3840+0
+    virtual:   7680x2160
+
+[WARN]  This will modify /etc/X11/xorg.conf (sudo required) and needs a reboot to take effect.
+  Continue? [y/N]
+```
+
+Type `y` to proceed. It will prompt for your `sudo` password, back up the existing `xorg.conf`, and write the new `metamodes`/`Virtual` lines into the `Screen` section. Then:
+
+```bash
 sudo reboot
 ```
 
-This writes a fixed `Option "metamodes"` + `Virtual` canvas size into `/etc/X11/xorg.conf` (backing up the original first), tiling the configured outputs left-to-right at `y=0` in the order they appear in your config. This raises the *ceiling* on the X virtual screen size so those resolutions are actually possible — without it, `xrandr` fails with `BadMatch` when trying to grow the screen.
+#### Verifying it worked
 
-Only outputs with a `DISPLAY_N_MODE` set are included; outputs without one are left to X's normal auto-configuration. Re-run `chromeman lock-resolutions` (and reboot again) any time you add/remove a `DISPLAY_N_MODE` or change the layout.
+After reboot:
 
-**Note:** on its own, `lock-resolutions` doesn't force the resolution to actually be applied — GNOME/mutter still resets outputs to their EDID-"preferred" mode on login. So `chromeman start` and the watchdog (`chromeman watch`) also run `xrandr` at startup to re-apply every `DISPLAY_N_MODE`, using the headroom `lock-resolutions` created. In other words: run `lock-resolutions` once (+ reboot) after changing `DISPLAY_N_MODE` values, and chromeman will keep re-applying them on every `start`/`restart`/watchdog launch after that.
+```bash
+DISPLAY=:0 xrandr --query | head -3
+```
+
+`current` should now be at least as large as the `virtual` size printed by `lock-resolutions` (e.g. `current 7680 x 2160`). If each output is still showing its old/EDID-preferred mode at this point, that's expected — `chromeman start`/`watch` apply the actual per-output modes next (see below). Run:
+
+```bash
+chromeman restart
+DISPLAY=:0 xrandr --query | head -6
+```
+
+and confirm each configured output now shows the `DISPLAY_N_MODE` resolution at the expected `+X+0` position.
+
+#### Ongoing behavior
+
+Once `lock-resolutions` has run and you've rebooted, **no further manual steps are needed**. Every `chromeman start`, `chromeman restart`, and watchdog relaunch automatically re-runs `xrandr` with your `DISPLAY_N_MODE` values (the `apply_modes` step), so the resolutions self-heal even after GNOME resets them on login.
+
+#### Changing the layout later
+
+If you add, remove, or change a `DISPLAY_N_MODE` (or add a new display with one):
+
+```bash
+chromeman lock-resolutions   # recompute and rewrite metamodes/Virtual
+sudo reboot
+chromeman restart
+```
+
+#### Reverting entirely
+
+To remove the forced layout and go back to X's default auto-configuration:
+
+```bash
+sudo cp /etc/X11/xorg.conf.bak.<timestamp> /etc/X11/xorg.conf   # pick the backup from before your first lock-resolutions run
+sudo reboot
+```
+
+Also remove any `DISPLAY_N_MODE` lines from `chrome-displays.conf` so `apply_modes` stops trying to re-apply them.
+
+#### Troubleshooting
+
+- **`BadMatch (RRSetScreenSize)` when `apply_modes` runs**: the `Virtual` size in `xorg.conf` is too small for your configured modes — re-run `chromeman lock-resolutions` (it recomputes `Virtual` from your current config) and reboot.
+- **Mode not in `xrandr --query`'s list for that output**: the cable/converter/monitor doesn't support it — `lock-resolutions` can't fix this; try a different mode or a different cable/converter.
+- **Black screen / X fails to start after reboot**: boot to a recovery shell (or SSH in) and restore the `xorg.conf.bak.<timestamp>` backup, then `sudo reboot`.
 
 ---
 
