@@ -1,6 +1,6 @@
 # chromeman
 
-A single-file bash utility for managing fullscreen Chrome kiosk windows across multiple Ubuntu virtual desktops. Designed for AV/production environments where you need persistent, auto-recovering browser displays — like a house of worship, lobby signage, or a broadcast control room.
+A single-file bash utility for managing fullscreen Chrome kiosk windows pinned to specific physical monitors on Ubuntu. Designed for AV/production environments where you need persistent, auto-recovering browser displays — like a house of worship, lobby signage, or a broadcast control room.
 
 Features a built-in watchdog that checks every N minutes and relaunches any dead windows, a pause/resume system for intentional shutdowns, and an HTTP API so tools like Bitfocus Companion can trigger restarts from a physical button.
 
@@ -11,10 +11,11 @@ Features a built-in watchdog that checks every N minutes and relaunches any dead
 - Ubuntu (tested on Ubuntu 22.04/24.04, X11 session — see [Wayland note](#wayland))
 - `google-chrome` or `chromium-browser`
 - `wmctrl` — `sudo apt install wmctrl`
+- `xrandr` — `sudo apt install x11-xserver-utils` *(used to find/verify monitor outputs; usually preinstalled)*
 - `netcat-openbsd` — `sudo apt install netcat-openbsd` *(HTTP server only)*
 - `python3` *(standard on Ubuntu — used for URL decoding in HTTP server)*
 
-> **Important:** The workspace-switching features require an **X11** session. At the Ubuntu login screen, click the gear icon and select **"Ubuntu on Xorg"** before logging in.
+> **Important:** Window placement requires an **X11** session. At the Ubuntu login screen, click the gear icon and select **"Ubuntu on Xorg"** before logging in.
 
 ---
 
@@ -40,10 +41,13 @@ sudo cp chromeman.sh /usr/local/bin/chromeman
 ## Quick Start
 
 ```bash
+# See your monitor output names (e.g. DP-7, DP-1, DP-3)
+chromeman outputs
+
 # Generate a config file at ~/chrome-manager/chrome-displays.conf
 chromeman init
 
-# Edit the config — set your workspace numbers and URLs
+# Edit the config — set your monitor outputs and URLs
 nano ~/chrome-manager/chrome-displays.conf
 
 # Launch all displays and start the watchdog
@@ -65,15 +69,15 @@ The config file defines each Chrome window. By default it lives at `~/chrome-man
 ```ini
 # Each display needs three keys, numbered from 1
 
-DISPLAY_1_WORKSPACE=1          # which virtual desktop (1-indexed)
+DISPLAY_1_OUTPUT=DP-7           # physical monitor (xrandr output name)
 DISPLAY_1_URL=https://example.com
 DISPLAY_1_PROFILE=chrome-kiosk-1  # unique Chrome profile name (no spaces)
 
-DISPLAY_2_WORKSPACE=2
+DISPLAY_2_OUTPUT=DP-1
 DISPLAY_2_URL=https://other.com
 DISPLAY_2_PROFILE=chrome-kiosk-2
 
-DISPLAY_3_WORKSPACE=3
+DISPLAY_3_OUTPUT=DP-3
 DISPLAY_3_URL=https://third.com
 DISPLAY_3_PROFILE=chrome-kiosk-3
 ```
@@ -83,7 +87,31 @@ See [`examples/chrome-displays.conf`](examples/chrome-displays.conf) for an anno
 **Rules:**
 - Numbers must start at `1` and be contiguous (`1, 2, 3` — not `1, 3`)
 - Each `PROFILE` value must be unique — Chrome data is stored at `~/.config/<PROFILE>`
+- `OUTPUT` must match an xrandr output name exactly (run `chromeman outputs` to list them)
 - Restart chromeman after editing the file (`chromeman restart`)
+
+---
+
+## Monitor Outputs
+
+chromeman pins each Chrome window to a specific physical monitor using its **xrandr output name** (e.g. `DP-7`, `DP-1`, `DP-3`). Run:
+
+```bash
+chromeman outputs
+```
+
+This prints the connected monitors and their output names — use the name from the rightmost column as `DISPLAY_N_OUTPUT`.
+
+### Will the output names change after a reboot or reconnect?
+
+Output names are tied to the **physical GPU port** the cable is plugged into, not to the monitor itself or the order things power on. As long as each cable stays in the same port on the graphics card, `DP-7` will always be `DP-7` — even if the monitors are slower to wake up or initialize in a different order on boot.
+
+**To keep things consistent:**
+- **Label the cables/ports** — physically mark which DisplayPort/mini-DP output on the GPU corresponds to which output name (e.g. with a sticker: "DP-7"), so if a cable ever gets unplugged for maintenance, it goes back in the right port.
+- **Don't swap cables between ports** — if a monitor is moved to a different GPU port, its output name changes and the config will no longer match.
+- **Run `chromeman outputs` after any hardware change** (new monitor, reseated cable, reboot after a power outage) to confirm the names still match your config.
+
+`chromeman start` and the watchdog (`chromeman watch`) automatically run a check on every cycle: if a configured output isn't currently detected by `xrandr`, a warning is printed/logged (`chromeman log`) naming the missing output and listing what's currently connected. That display will still attempt to launch, but without monitor-specific placement — keep an eye out for these warnings after any hardware change.
 
 ---
 
@@ -98,6 +126,7 @@ See [`examples/chrome-displays.conf`](examples/chrome-displays.conf) for an anno
 | `resume` | Re-enable and relaunch a paused display |
 | `status` | Show the running state of every display and the watchdog |
 | `watch` | Run the watchdog loop in the foreground (used internally) |
+| `outputs` | List detected monitor outputs (via `xrandr`) |
 | `http-server` | Start the HTTP API for Companion integration |
 | `install` | Register the watchdog as a systemd user service |
 | `install-http` | Register the HTTP server as a systemd user service |
@@ -342,15 +371,24 @@ These are isolated from your main Chrome profile, so kiosk sessions never interf
 
 ## Troubleshooting
 
-### Windows land on the wrong workspace
+### Windows land on the wrong monitor
 
-This is almost always a Wayland issue. Check:
+First check for output-mismatch warnings:
+
+```bash
+chromeman log
+chromeman outputs
+```
+
+If a configured `DISPLAY_N_OUTPUT` isn't in the `chromeman outputs` list, a cable was likely moved to a different GPU port, or the monitor was off when X started. Update the config to match, or move the cable back. See [Monitor Outputs](#monitor-outputs).
+
+If all configured outputs are detected but placement still looks wrong, this is almost always a Wayland issue. Check:
 
 ```bash
 echo $XDG_SESSION_TYPE
 ```
 
-If it says `wayland`, log out and select **"Ubuntu on Xorg"** at the login screen. `wmctrl` does not support Wayland workspace management.
+If it says `wayland`, log out and select **"Ubuntu on Xorg"** at the login screen. `wmctrl` does not support Wayland window placement.
 
 ### Chrome command not found
 
@@ -393,8 +431,11 @@ sudo ufw allow 7070/tcp
 # Show all chromeman-related processes
 pgrep -a -f "chrome-kiosk"
 
-# List all windows and their workspace
-wmctrl -l
+# List all windows and their position/geometry
+wmctrl -lG
+
+# List detected monitors
+chromeman outputs
 
 # Check systemd service status
 systemctl --user status chromeman
@@ -405,7 +446,7 @@ systemctl --user status chromeman-http
 
 ## Wayland
 
-`wmctrl` — which chromeman uses to move windows between workspaces — does not work under Wayland. The script will launch Chrome but cannot guarantee it lands on the correct virtual desktop.
+`wmctrl` — which chromeman uses to position windows on specific monitors — does not work under Wayland. The script will launch Chrome but cannot guarantee it lands on the correct physical display.
 
 **Workaround:** Use an X11 session. At the Ubuntu login screen, click the gear icon (⚙) in the bottom-right and select **"Ubuntu on Xorg"**.
 

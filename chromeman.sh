@@ -2,7 +2,7 @@
 # =============================================================================
 # chromeman — Chrome Kiosk Display Manager
 # =============================================================================
-# Manages fullscreen Chrome windows across multiple virtual desktops.
+# Manages fullscreen Chrome windows pinned to specific physical monitors.
 #
 # USAGE:
 #   chromeman [COMMAND] [OPTIONS]
@@ -13,6 +13,7 @@
 #   restart             stop + start
 #   status              Show current state of all displays and watchdog
 #   watch               Run the watchdog in the foreground (used internally)
+#   outputs             List detected monitor outputs (via xrandr)
 #   install             Install as a systemd user service (auto-start on login)
 #   uninstall           Remove the systemd user service
 #   log                 Tail the watchdog log
@@ -25,6 +26,7 @@
 #   -v, --version       Show version
 #
 # EXAMPLES:
+#   chromeman outputs
 #   chromeman start
 #   chromeman start --config /etc/chrome-displays.conf
 #   chromeman stop
@@ -36,7 +38,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -50,6 +52,8 @@ SERVICE_NAME="chromeman"
 HTTP_SERVICE_NAME="chromeman-http"
 SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
 HTTP_SERVICE_FILE="$HOME/.config/systemd/user/${HTTP_SERVICE_NAME}.service"
+
+export DISPLAY="${DISPLAY:-:0}"
 
 # =============================================================================
 # Helpers
@@ -71,17 +75,44 @@ require_wmctrl() {
     command -v wmctrl &>/dev/null || die "wmctrl is not installed. Run: sudo apt install wmctrl"
 }
 
+require_xrandr() {
+    command -v xrandr &>/dev/null || die "xrandr is not installed. Run: sudo apt install x11-xserver-utils"
+}
+
 require_config() {
     [[ -f "$CONFIG_FILE" ]] || die "Config file not found: $CONFIG_FILE
   Create one with: chromeman init"
 }
 
 # =============================================================================
-# Config parsing — populates WORKSPACES[], URLS[], PROFILES[]
+# Monitor geometry — maps an xrandr output name to "X Y W H"
+# =============================================================================
+
+get_monitor_geometry() {
+    local output="$1"
+    local line geom
+    line=$(xrandr --listmonitors | grep -E "[[:space:]]${output}$")
+    [[ -n "$line" ]] || return 1
+
+    # Field 3 looks like: 3840/1020x2160/570+5760+0  (strip the /<mm> parts)
+    geom=$(echo "$line" | awk '{print $3}' | sed -E 's#/[0-9]+##g')
+
+    local w h x y
+    w=$(echo "$geom" | grep -oP '^[0-9]+')
+    h=$(echo "$geom" | grep -oP 'x\K[0-9]+')
+    x=$(echo "$geom" | grep -oP '\+\K[0-9]+(?=\+)')
+    y=$(echo "$geom" | grep -oP '\+[0-9]+\+\K[0-9]+')
+
+    [[ -n "$w" && -n "$h" && -n "$x" && -n "$y" ]] || return 1
+    echo "$x $y $w $h"
+}
+
+# =============================================================================
+# Config parsing — populates OUTPUTS[], URLS[], PROFILES[]
 # =============================================================================
 
 load_config() {
-    WORKSPACES=()
+    OUTPUTS=()
     URLS=()
     PROFILES=()
 
@@ -92,19 +123,43 @@ load_config() {
     [[ -n "$max_n" ]] || die "No DISPLAY_* entries found in $CONFIG_FILE"
 
     for n in $(seq 1 "$max_n"); do
-        local ws url prof
-        ws=$(grep   "^DISPLAY_${n}_WORKSPACE=" "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
-        url=$(grep  "^DISPLAY_${n}_URL="       "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
-        prof=$(grep "^DISPLAY_${n}_PROFILE="   "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        local out url prof
+        out=$(grep  "^DISPLAY_${n}_OUTPUT="  "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        url=$(grep  "^DISPLAY_${n}_URL="     "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        prof=$(grep "^DISPLAY_${n}_PROFILE=" "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
 
-        if [[ -n "$ws" && -n "$url" && -n "$prof" ]]; then
-            WORKSPACES+=("$ws")
+        if [[ -n "$out" && -n "$url" && -n "$prof" ]]; then
+            OUTPUTS+=("$out")
             URLS+=("$url")
             PROFILES+=("$prof")
         fi
     done
 
-    [[ ${#WORKSPACES[@]} -gt 0 ]] || die "No valid display entries found in $CONFIG_FILE"
+    [[ ${#OUTPUTS[@]} -gt 0 ]] || die "No valid display entries found in $CONFIG_FILE"
+}
+
+# =============================================================================
+# Validate that every configured output is currently connected
+# =============================================================================
+
+validate_outputs() {
+    local connected
+    connected=$(xrandr --listmonitors | awk 'NR>1 {print $NF}')
+
+    local missing=()
+    local out
+    for out in "${OUTPUTS[@]}"; do
+        if ! grep -qxF "$out" <<< "$connected"; then
+            missing+=("$out")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        warn "Configured output(s) not currently detected: ${missing[*]}"
+        warn "Connected outputs right now: $(echo "$connected" | tr '\n' ' ')"
+        warn "If a monitor was moved to a different port or is powered off, displays may launch on the wrong screen or without placement."
+        warn "Run 'chromeman outputs' to see current monitor names."
+    fi
 }
 
 # =============================================================================
@@ -136,38 +191,46 @@ resume_display() {
 }
 
 # =============================================================================
-# Launch a single Chrome instance onto a workspace
+# Launch a single Chrome instance pinned to a physical monitor output
 # =============================================================================
 
 launch_one() {
-    local workspace="$1"
+    local output="$1"
     local url="$2"
     local profile_name="$3"
+    local dn="$4"
     local prof_dir
     prof_dir=$(profile_dir "$profile_name")
-    local ws_index=$(( workspace - 1 ))
-    local tag="[Display $workspace]"
+    local tag="[Display $dn]"
 
-    log "$tag Switching to workspace $workspace..."
-    wmctrl -s "$ws_index"
-    sleep 0.3
+    local geom="" x y w h
+    if geom=$(get_monitor_geometry "$output"); then
+        read -r x y w h <<< "$geom"
+    else
+        warn "$tag Output '$output' not found via xrandr — launching without placement."
+    fi
 
-    log "$tag Launching → $url"
-    google-chrome \
-        --new-window \
-        --kiosk \
-        --start-fullscreen \
-        --autoplay-policy=no-user-gesture-required \
-        --user-data-dir="$prof_dir" \
-        --no-default-browser-check \
-        --disable-session-crashed-bubble \
-        --disable-infobars \
-        "$url" &
+    log "$tag Launching → $url (output: $output)"
+
+    local -a chrome_args=(
+        --new-window
+        --kiosk
+        --start-fullscreen
+        --autoplay-policy=no-user-gesture-required
+        --user-data-dir="$prof_dir"
+        --no-default-browser-check
+        --disable-session-crashed-bubble
+        --disable-infobars
+    )
+    [[ -n "$geom" ]] && chrome_args+=(--window-position="${x},${y}" --window-size="${w},${h}")
+    chrome_args+=("$url")
+
+    google-chrome "${chrome_args[@]}" &
 
     local chrome_pid=$!
     log "$tag Chrome started (PID $chrome_pid)"
 
-    # Wait for window then place it correctly
+    # Wait for window then pin it to the correct monitor
     for i in $(seq 1 20); do
         sleep 0.5
         local win_id
@@ -183,10 +246,13 @@ launch_one() {
         fi
 
         if [[ -n "$win_id" ]]; then
-            log "$tag Window $win_id found — moving to workspace $workspace"
-            wmctrl -i -r "$win_id" -t "$ws_index"
-            wmctrl -s "$ws_index"
-            sleep 0.3
+            log "$tag Window $win_id found."
+            if [[ -n "$geom" ]]; then
+                log "$tag Moving to $output (${w}x${h}+${x}+${y})"
+                wmctrl -i -r "$win_id" -b remove,fullscreen
+                wmctrl -i -r "$win_id" -e "0,$x,$y,$w,$h"
+                sleep 0.3
+            fi
             wmctrl -i -r "$win_id" -b add,fullscreen
             log "$tag Ready."
             return 0
@@ -203,35 +269,38 @@ launch_one() {
 
 cmd_start() {
     require_wmctrl
+    require_xrandr
     load_config
+    validate_outputs
 
-    info "Starting ${#WORKSPACES[@]} display(s)..."
+    info "Starting ${#OUTPUTS[@]} display(s)..."
     mkdir -p "$DEFAULT_CONFIG_DIR"
 
-    local count=${#WORKSPACES[@]}
+    local count=${#OUTPUTS[@]}
     for (( i=0; i<count; i++ )); do
+        local dn=$(( i+1 ))
         # Skip if a specific display was requested and this isn't it
-        if [[ -n "$TARGET_DISPLAY" && "$TARGET_DISPLAY" != $(( i+1 )) && \
-              "$TARGET_DISPLAY" != "${WORKSPACES[$i]}" ]]; then
+        if [[ -n "$TARGET_DISPLAY" && "$TARGET_DISPLAY" != "$dn" && \
+              "$TARGET_DISPLAY" != "${OUTPUTS[$i]}" ]]; then
             continue
         fi
 
         if is_running "${PROFILES[$i]}"; then
-            ok "Display ${WORKSPACES[$i]} already running — skipping."
+            ok "Display $dn (${OUTPUTS[$i]}) already running — skipping."
         elif is_paused "${PROFILES[$i]}"; then
             if [[ -n "$TARGET_DISPLAY" ]]; then
                 # Explicit single-display start clears the pause lock
                 resume_display "${PROFILES[$i]}"
-                info "Display ${WORKSPACES[$i]} unpaused."
+                info "Display $dn (${OUTPUTS[$i]}) unpaused."
                 local url="${OVERRIDE_URL:-${URLS[$i]}}"
-                launch_one "${WORKSPACES[$i]}" "$url" "${PROFILES[$i]}"
+                launch_one "${OUTPUTS[$i]}" "$url" "${PROFILES[$i]}" "$dn"
                 sleep 1
             else
-                warn "Display ${WORKSPACES[$i]} is paused — skipping (run: chromeman resume -d ${WORKSPACES[$i]})."
+                warn "Display $dn (${OUTPUTS[$i]}) is paused — skipping (run: chromeman resume -d $dn)."
             fi
         else
             local url="${OVERRIDE_URL:-${URLS[$i]}}"
-            launch_one "${WORKSPACES[$i]}" "$url" "${PROFILES[$i]}"
+            launch_one "${OUTPUTS[$i]}" "$url" "${PROFILES[$i]}" "$dn"
             sleep 1  # stagger to avoid WM race conditions
         fi
     done
@@ -264,29 +333,30 @@ cmd_stop() {
         stop_watchdog
     fi
 
-    local count=${#WORKSPACES[@]}
+    local count=${#OUTPUTS[@]}
     for (( i=0; i<count; i++ )); do
-        if [[ -n "$TARGET_DISPLAY" && "$TARGET_DISPLAY" != $(( i+1 )) && \
-              "$TARGET_DISPLAY" != "${WORKSPACES[$i]}" ]]; then
+        local dn=$(( i+1 ))
+        if [[ -n "$TARGET_DISPLAY" && "$TARGET_DISPLAY" != "$dn" && \
+              "$TARGET_DISPLAY" != "${OUTPUTS[$i]}" ]]; then
             continue
         fi
 
         local prof="${PROFILES[$i]}"
-        local ws="${WORKSPACES[$i]}"
+        local out="${OUTPUTS[$i]}"
 
         # --no-restart: write a pause lock so the watchdog won't relaunch this display
         if [[ "$NO_RESTART" == "1" ]]; then
             pause_display "$prof"
-            info "Display $ws marked as paused (watchdog will not relaunch it)."
+            info "Display $dn ($out) marked as paused (watchdog will not relaunch it)."
         fi
 
         local pids
         pids=$(get_pids "$prof")
 
         if [[ -z "$pids" ]]; then
-            info "Display $ws not running."
+            info "Display $dn ($out) not running."
         else
-            info "Closing display $ws (PIDs: $pids)..."
+            info "Closing display $dn ($out) (PIDs: $pids)..."
             kill $pids 2>/dev/null
         fi
     done
@@ -294,14 +364,15 @@ cmd_stop() {
     # Wait then force-kill stragglers
     sleep 3
     for (( i=0; i<count; i++ )); do
-        if [[ -n "$TARGET_DISPLAY" && "$TARGET_DISPLAY" != $(( i+1 )) && \
-              "$TARGET_DISPLAY" != "${WORKSPACES[$i]}" ]]; then
+        local dn=$(( i+1 ))
+        if [[ -n "$TARGET_DISPLAY" && "$TARGET_DISPLAY" != "$dn" && \
+              "$TARGET_DISPLAY" != "${OUTPUTS[$i]}" ]]; then
             continue
         fi
         local remaining
         remaining=$(get_pids "${PROFILES[$i]}")
         if [[ -n "$remaining" ]]; then
-            warn "Force-killing display ${WORKSPACES[$i]}..."
+            warn "Force-killing display $dn (${OUTPUTS[$i]})..."
             kill -9 $remaining 2>/dev/null
         fi
     done
@@ -337,20 +408,22 @@ cmd_status() {
     echo "  └─────────────────────────────────────────────────────┘"
     echo ""
 
-    local count=${#WORKSPACES[@]}
+    local count=${#OUTPUTS[@]}
     for (( i=0; i<count; i++ )); do
-        local ws="${WORKSPACES[$i]}"
+        local dn=$(( i+1 ))
+        local out="${OUTPUTS[$i]}"
         local url="${URLS[$i]}"
         local prof="${PROFILES[$i]}"
         local pids
         pids=$(get_pids "$prof")
+        local label="$dn ($out)"
 
         if [[ -n "$pids" ]]; then
-            printf "  \033[1;32m●\033[0m  Display %-2s  %-40s  PIDs: %s\n" "$ws" "$url" "$pids"
+            printf "  \033[1;32m●\033[0m  Display %-10s  %-40s  PIDs: %s\n" "$label" "$url" "$pids"
         elif is_paused "$prof"; then
-            printf "  \033[1;33m⏸\033[0m  Display %-2s  %-40s  paused\n" "$ws" "$url"
+            printf "  \033[1;33m⏸\033[0m  Display %-10s  %-40s  paused\n" "$label" "$url"
         else
-            printf "  \033[1;31m○\033[0m  Display %-2s  %-40s  not running\n" "$ws" "$url"
+            printf "  \033[1;31m○\033[0m  Display %-10s  %-40s  not running\n" "$label" "$url"
         fi
     done
 
@@ -375,11 +448,25 @@ cmd_status() {
 }
 
 # =============================================================================
+# COMMAND: outputs — list detected monitor outputs (via xrandr)
+# =============================================================================
+
+cmd_outputs() {
+    require_xrandr
+    info "Detected monitor outputs:"
+    echo ""
+    xrandr --listmonitors
+    echo ""
+    info "Use the name in the rightmost column (e.g. DP-7) as DISPLAY_N_OUTPUT in your config."
+}
+
+# =============================================================================
 # COMMAND: watch (watchdog loop — called internally, or run directly)
 # =============================================================================
 
 cmd_watch() {
     require_wmctrl
+    require_xrandr
     load_config
     mkdir -p "$DEFAULT_CONFIG_DIR"
 
@@ -389,20 +476,23 @@ cmd_watch() {
     log "Interval: ${INTERVAL}s"
     log "========================================"
 
+    validate_outputs
+
     while true; do
-        local count=${#WORKSPACES[@]}
+        local count=${#OUTPUTS[@]}
         for (( i=0; i<count; i++ )); do
-            local ws="${WORKSPACES[$i]}"
+            local dn=$(( i+1 ))
+            local out="${OUTPUTS[$i]}"
             local url="${URLS[$i]}"
             local prof="${PROFILES[$i]}"
 
             if is_paused "$prof"; then
-                log "[Display $ws] ⏸ Paused — skipping"
+                log "[Display $dn] ⏸ Paused — skipping"
             elif is_running "$prof"; then
-                log "[Display $ws] ✓ Running"
+                log "[Display $dn] ✓ Running"
             else
-                log "[Display $ws] ✗ Not running — relaunching → $url"
-                launch_one "$ws" "$url" "$prof"
+                log "[Display $dn] ✗ Not running — relaunching → $url"
+                launch_one "$out" "$url" "$prof" "$dn"
                 sleep 2
             fi
         done
@@ -421,31 +511,32 @@ cmd_pause() {
 
     [[ -n "$TARGET_DISPLAY" ]] || die "pause requires -d <display>. Example: chromeman pause -d 2"
 
-    local count=${#WORKSPACES[@]}
+    local count=${#OUTPUTS[@]}
     local matched=0
     for (( i=0; i<count; i++ )); do
-        if [[ "$TARGET_DISPLAY" != $(( i+1 )) && "$TARGET_DISPLAY" != "${WORKSPACES[$i]}" ]]; then
+        local dn=$(( i+1 ))
+        if [[ "$TARGET_DISPLAY" != "$dn" && "$TARGET_DISPLAY" != "${OUTPUTS[$i]}" ]]; then
             continue
         fi
         matched=1
         local prof="${PROFILES[$i]}"
-        local ws="${WORKSPACES[$i]}"
+        local out="${OUTPUTS[$i]}"
 
         pause_display "$prof"
-        info "Display $ws paused — watchdog will no longer relaunch it."
+        info "Display $dn ($out) paused — watchdog will no longer relaunch it."
 
         local pids
         pids=$(get_pids "$prof")
         if [[ -n "$pids" ]]; then
-            info "Closing display $ws (PIDs: $pids)..."
+            info "Closing display $dn ($out) (PIDs: $pids)..."
             kill $pids 2>/dev/null
             sleep 3
             pids=$(get_pids "$prof")
             [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null
         else
-            info "Display $ws was not running."
+            info "Display $dn ($out) was not running."
         fi
-        ok "Display $ws paused."
+        ok "Display $dn ($out) paused."
     done
 
     [[ $matched -eq 1 ]] || die "No display matching '$TARGET_DISPLAY' found in config."
@@ -457,34 +548,36 @@ cmd_pause() {
 
 cmd_resume() {
     require_wmctrl
+    require_xrandr
     load_config
 
     [[ -n "$TARGET_DISPLAY" ]] || die "resume requires -d <display>. Example: chromeman resume -d 2"
 
-    local count=${#WORKSPACES[@]}
+    local count=${#OUTPUTS[@]}
     local matched=0
     for (( i=0; i<count; i++ )); do
-        if [[ "$TARGET_DISPLAY" != $(( i+1 )) && "$TARGET_DISPLAY" != "${WORKSPACES[$i]}" ]]; then
+        local dn=$(( i+1 ))
+        if [[ "$TARGET_DISPLAY" != "$dn" && "$TARGET_DISPLAY" != "${OUTPUTS[$i]}" ]]; then
             continue
         fi
         matched=1
         local prof="${PROFILES[$i]}"
-        local ws="${WORKSPACES[$i]}"
+        local out="${OUTPUTS[$i]}"
         local url="${URLS[$i]}"
 
         if ! is_paused "$prof"; then
-            warn "Display $ws is not paused."
+            warn "Display $dn ($out) is not paused."
         else
             resume_display "$prof"
-            ok "Display $ws unpaused."
+            ok "Display $dn ($out) unpaused."
         fi
 
         if is_running "$prof"; then
-            ok "Display $ws already running."
+            ok "Display $dn ($out) already running."
         else
             local url="${OVERRIDE_URL:-$url}"
-            info "Launching display $ws → $url"
-            launch_one "$ws" "$url" "$prof"
+            info "Launching display $dn ($out) → $url"
+            launch_one "$out" "$url" "$prof" "$dn"
         fi
     done
 
@@ -564,22 +657,28 @@ cmd_init() {
     mkdir -p "$(dirname "$CONFIG_FILE")"
     cat > "$CONFIG_FILE" <<'EOF'
 # chromeman display config
-# One block per display. Workspace is 1-indexed (desktop number).
+# One block per display, numbered from 1.
+#
+# DISPLAY_N_OUTPUT  = xrandr output name for the physical monitor
+#                     (run `chromeman outputs` to list them, e.g. DP-7)
+# DISPLAY_N_URL     = page to load in kiosk mode
+# DISPLAY_N_PROFILE = unique Chrome profile name (no spaces)
 
-DISPLAY_1_WORKSPACE=1
+DISPLAY_1_OUTPUT=DP-7
 DISPLAY_1_URL=https://www.example.com
 DISPLAY_1_PROFILE=chrome-kiosk-1
 
-DISPLAY_2_WORKSPACE=2
+DISPLAY_2_OUTPUT=DP-1
 DISPLAY_2_URL=https://www.example2.com
 DISPLAY_2_PROFILE=chrome-kiosk-2
 
-DISPLAY_3_WORKSPACE=3
+DISPLAY_3_OUTPUT=DP-3
 DISPLAY_3_URL=https://www.example3.com
 DISPLAY_3_PROFILE=chrome-kiosk-3
 EOF
     ok "Config created: $CONFIG_FILE"
-    info "Edit it then run: chromeman start"
+    info "Run 'chromeman outputs' to see your monitor names, then edit the config."
+    info "Then run: chromeman start"
 }
 
 # =============================================================================
@@ -679,13 +778,13 @@ print(p.get('url', [''])[0])
             /status)
                 load_config 2>/dev/null
                 local json='{"displays":['
-                local count=${#WORKSPACES[@]}
+                local count=${#OUTPUTS[@]}
                 for (( i=0; i<count; i++ )); do
                     local state="stopped"
                     is_paused  "${PROFILES[$i]}" && state="paused"
                     is_running "${PROFILES[$i]}" && state="running"
                     [[ $i -gt 0 ]] && json+=","
-                    json+="{\"display\":${WORKSPACES[$i]},\"url\":\"${URLS[$i]}\",\"state\":\"$state\"}"
+                    json+="{\"display\":$(( i+1 )),\"output\":\"${OUTPUTS[$i]}\",\"url\":\"${URLS[$i]}\",\"state\":\"$state\"}"
                 done
                 json+="],"
                 watchdog_running && json+='"watchdog":"running"' || json+='"watchdog":"stopped"'
@@ -808,6 +907,7 @@ cmd_help() {
     resume          Re-enable and relaunch a paused display
     status          Show running state of all displays and watchdog
     watch           Run watchdog in foreground (used internally by start)
+    outputs         List detected monitor outputs (via xrandr)
     http-server     Start HTTP API server for Companion integration
     install         Install watchdog as a systemd user service
     install-http    Install HTTP server as a systemd user service
@@ -840,6 +940,7 @@ cmd_help() {
     GET /status                 returns JSON state of all displays
 
   \033[1mEXAMPLES\033[0m
+    chromeman outputs                           # list monitor names (e.g. DP-7)
     chromeman init                              # create default config
     chromeman start                             # launch everything
     chromeman start -d 2 -u https://example.com # launch display 2 with custom URL
@@ -907,6 +1008,7 @@ case "$COMMAND" in
     resume)         cmd_resume ;;
     status)         cmd_status ;;
     watch)          cmd_watch ;;
+    outputs)        cmd_outputs ;;
     http-server)    cmd_http_server ;;
     install)        cmd_install ;;
     install-http)   cmd_install_http ;;
