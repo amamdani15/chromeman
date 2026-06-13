@@ -14,6 +14,7 @@
 #   status              Show current state of all displays and watchdog
 #   watch               Run the watchdog in the foreground (used internally)
 #   outputs             List detected monitor outputs (via xrandr)
+#   audio-sinks         List audio sinks for per-display audio routing
 #   install             Install as a systemd user service (auto-start on login)
 #   uninstall           Remove the systemd user service
 #   log                 Tail the watchdog log
@@ -115,6 +116,7 @@ load_config() {
     OUTPUTS=()
     URLS=()
     PROFILES=()
+    AUDIO_SINKS=()
 
     require_config
 
@@ -123,15 +125,17 @@ load_config() {
     [[ -n "$max_n" ]] || die "No DISPLAY_* entries found in $CONFIG_FILE"
 
     for n in $(seq 1 "$max_n"); do
-        local out url prof
-        out=$(grep  "^DISPLAY_${n}_OUTPUT="  "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
-        url=$(grep  "^DISPLAY_${n}_URL="     "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
-        prof=$(grep "^DISPLAY_${n}_PROFILE=" "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        local out url prof sink
+        out=$(grep  "^DISPLAY_${n}_OUTPUT="     "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        url=$(grep  "^DISPLAY_${n}_URL="        "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        prof=$(grep "^DISPLAY_${n}_PROFILE="    "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        sink=$(grep "^DISPLAY_${n}_AUDIO_SINK=" "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
 
         if [[ -n "$out" && -n "$url" && -n "$prof" ]]; then
             OUTPUTS+=("$out")
             URLS+=("$url")
             PROFILES+=("$prof")
+            AUDIO_SINKS+=("$sink")
         fi
     done
 
@@ -199,6 +203,7 @@ launch_one() {
     local url="$2"
     local profile_name="$3"
     local dn="$4"
+    local audio_sink="$5"
     local prof_dir
     prof_dir=$(profile_dir "$profile_name")
     local tag="[Display $dn]"
@@ -225,7 +230,12 @@ launch_one() {
     [[ -n "$geom" ]] && chrome_args+=(--window-position="${x},${y}" --window-size="${w},${h}")
     chrome_args+=("$url")
 
-    google-chrome "${chrome_args[@]}" &
+    if [[ -n "$audio_sink" ]]; then
+        log "$tag Audio → $audio_sink"
+        PULSE_SINK="$audio_sink" google-chrome "${chrome_args[@]}" &
+    else
+        google-chrome "${chrome_args[@]}" &
+    fi
 
     local chrome_pid=$!
     log "$tag Chrome started (PID $chrome_pid)"
@@ -293,14 +303,14 @@ cmd_start() {
                 resume_display "${PROFILES[$i]}"
                 info "Display $dn (${OUTPUTS[$i]}) unpaused."
                 local url="${OVERRIDE_URL:-${URLS[$i]}}"
-                launch_one "${OUTPUTS[$i]}" "$url" "${PROFILES[$i]}" "$dn"
+                launch_one "${OUTPUTS[$i]}" "$url" "${PROFILES[$i]}" "$dn" "${AUDIO_SINKS[$i]}"
                 sleep 1
             else
                 warn "Display $dn (${OUTPUTS[$i]}) is paused — skipping (run: chromeman resume -d $dn)."
             fi
         else
             local url="${OVERRIDE_URL:-${URLS[$i]}}"
-            launch_one "${OUTPUTS[$i]}" "$url" "${PROFILES[$i]}" "$dn"
+            launch_one "${OUTPUTS[$i]}" "$url" "${PROFILES[$i]}" "$dn" "${AUDIO_SINKS[$i]}"
             sleep 1  # stagger to avoid WM race conditions
         fi
     done
@@ -461,6 +471,23 @@ cmd_outputs() {
 }
 
 # =============================================================================
+# COMMAND: audio-sinks — list PulseAudio/PipeWire sinks for per-display audio
+# =============================================================================
+
+cmd_audio_sinks() {
+    command -v pactl &>/dev/null || die "pactl not found. Run: sudo apt install pulseaudio-utils"
+    info "Available audio sinks:"
+    echo ""
+    pactl list short sinks
+    echo ""
+    info "Use the sink name (2nd column) as DISPLAY_N_AUDIO_SINK in your config."
+    echo ""
+    info "If a sink exposes multiple ports (one per DP/HDMI output), list ports with:"
+    echo "       pactl list sinks | less"
+    info "Each port may need its own sink — see the Audio Routing section of the README."
+}
+
+# =============================================================================
 # COMMAND: watch (watchdog loop — called internally, or run directly)
 # =============================================================================
 
@@ -492,7 +519,7 @@ cmd_watch() {
                 log "[Display $dn] ✓ Running"
             else
                 log "[Display $dn] ✗ Not running — relaunching → $url"
-                launch_one "$out" "$url" "$prof" "$dn"
+                launch_one "$out" "$url" "$prof" "$dn" "${AUDIO_SINKS[$i]}"
                 sleep 2
             fi
         done
@@ -577,7 +604,7 @@ cmd_resume() {
         else
             local url="${OVERRIDE_URL:-$url}"
             info "Launching display $dn ($out) → $url"
-            launch_one "$out" "$url" "$prof" "$dn"
+            launch_one "$out" "$url" "$prof" "$dn" "${AUDIO_SINKS[$i]}"
         fi
     done
 
@@ -659,22 +686,27 @@ cmd_init() {
 # chromeman display config
 # One block per display, numbered from 1.
 #
-# DISPLAY_N_OUTPUT  = xrandr output name for the physical monitor
-#                     (run `chromeman outputs` to list them, e.g. DP-7)
-# DISPLAY_N_URL     = page to load in kiosk mode
-# DISPLAY_N_PROFILE = unique Chrome profile name (no spaces)
+# DISPLAY_N_OUTPUT      = xrandr output name for the physical monitor
+#                         (run `chromeman outputs` to list them, e.g. DP-7)
+# DISPLAY_N_URL         = page to load in kiosk mode
+# DISPLAY_N_PROFILE     = unique Chrome profile name (no spaces)
+# DISPLAY_N_AUDIO_SINK  = (optional) PulseAudio sink name for this display's audio
+#                         (run `chromeman audio-sinks` to list them)
 
 DISPLAY_1_OUTPUT=DP-7
 DISPLAY_1_URL=https://www.example.com
 DISPLAY_1_PROFILE=chrome-kiosk-1
+# DISPLAY_1_AUDIO_SINK=alsa_output.pci-0000_01_00.1.hdmi-stereo
 
 DISPLAY_2_OUTPUT=DP-1
 DISPLAY_2_URL=https://www.example2.com
 DISPLAY_2_PROFILE=chrome-kiosk-2
+# DISPLAY_2_AUDIO_SINK=alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1
 
 DISPLAY_3_OUTPUT=DP-3
 DISPLAY_3_URL=https://www.example3.com
 DISPLAY_3_PROFILE=chrome-kiosk-3
+# DISPLAY_3_AUDIO_SINK=alsa_output.pci-0000_01_00.1.hdmi-stereo-extra2
 EOF
     ok "Config created: $CONFIG_FILE"
     info "Run 'chromeman outputs' to see your monitor names, then edit the config."
@@ -908,6 +940,7 @@ cmd_help() {
     status          Show running state of all displays and watchdog
     watch           Run watchdog in foreground (used internally by start)
     outputs         List detected monitor outputs (via xrandr)
+    audio-sinks     List audio sinks for per-display audio routing
     http-server     Start HTTP API server for Companion integration
     install         Install watchdog as a systemd user service
     install-http    Install HTTP server as a systemd user service
@@ -941,6 +974,7 @@ cmd_help() {
 
   \033[1mEXAMPLES\033[0m
     chromeman outputs                           # list monitor names (e.g. DP-7)
+    chromeman audio-sinks                       # list audio sinks for per-display audio
     chromeman init                              # create default config
     chromeman start                             # launch everything
     chromeman start -d 2 -u https://example.com # launch display 2 with custom URL
@@ -1009,6 +1043,7 @@ case "$COMMAND" in
     status)         cmd_status ;;
     watch)          cmd_watch ;;
     outputs)        cmd_outputs ;;
+    audio-sinks)    cmd_audio_sinks ;;
     http-server)    cmd_http_server ;;
     install)        cmd_install ;;
     install-http)   cmd_install_http ;;

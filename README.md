@@ -115,6 +115,60 @@ Output names are tied to the **physical GPU port** the cable is plugged into, no
 
 ---
 
+## Audio Routing
+
+Each display can optionally have its own `DISPLAY_N_AUDIO_SINK`, so that Chrome window's audio plays only out of the speakers/audio device connected to that monitor's output. This is set via Chrome's `PULSE_SINK` environment variable, applied per-launch — no global PulseAudio config changes needed.
+
+### Finding sink names
+
+```bash
+chromeman audio-sinks
+```
+
+This runs `pactl list short sinks` and shows the sink name to use for `DISPLAY_N_AUDIO_SINK`.
+
+### How NVIDIA multi-output audio usually looks
+
+A single NVIDIA GPU with multiple DisplayPort outputs typically exposes **one PCI audio device** with **multiple ports** (one per DP output), e.g.:
+
+```
+alsa_output.pci-0000_01_00.1.hdmi-stereo
+alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1
+alsa_output.pci-0000_01_00.1.hdmi-stereo-extra2
+```
+
+Each of these is a separate **sink**, and each corresponds to a different physical DP output. Assign the sink that matches each monitor's output to that display's `DISPLAY_N_AUDIO_SINK`.
+
+### Matching a sink to a specific monitor
+
+If it's not obvious which `extraN` sink maps to which `DP-N` output, test one at a time:
+
+```bash
+# Play a test tone on a specific sink and listen for which monitor's speakers play it
+paplay --device=alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1 /usr/share/sounds/alsa/Front_Center.wav
+```
+
+Repeat for each sink until you've matched all of them to their monitors, then fill in `DISPLAY_N_AUDIO_SINK` accordingly.
+
+### If your hardware only exposes one combined sink
+
+Some setups expose all DP audio outputs as **ports on a single sink** rather than separate sinks — in that case only one port can be "active" at a time, and `PULSE_SINK` alone won't separate the audio per window. If `chromeman audio-sinks` shows only one sink but `pactl list sinks` shows multiple ports under it, you'll need to create a dedicated virtual sink per port:
+
+```bash
+# Find the ALSA hw device for each port
+pactl list sinks | grep -A5 "Ports:"
+
+# Create a separate sink bound to each hardware output (repeat per port)
+pactl load-module module-alsa-sink device=hw:1,3 sink_name=display1_audio
+pactl load-module module-alsa-sink device=hw:1,7 sink_name=display2_audio
+```
+
+Then use `display1_audio`, `display2_audio`, etc. as your `DISPLAY_N_AUDIO_SINK` values. To make these persist across reboots, add the `load-module` lines to `/etc/pulse/default.pa` (or the equivalent PipeWire/WirePlumber config on newer Ubuntu).
+
+Leave `DISPLAY_N_AUDIO_SINK` blank/unset for any display that should just use the system default audio output.
+
+---
+
 ## Commands
 
 | Command | Description |
@@ -127,6 +181,7 @@ Output names are tied to the **physical GPU port** the cable is plugged into, no
 | `status` | Show the running state of every display and the watchdog |
 | `watch` | Run the watchdog loop in the foreground (used internally) |
 | `outputs` | List detected monitor outputs (via `xrandr`) |
+| `audio-sinks` | List audio sinks for per-display audio routing |
 | `http-server` | Start the HTTP API for Companion integration |
 | `install` | Register the watchdog as a systemd user service |
 | `install-http` | Register the HTTP server as a systemd user service |
