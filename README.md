@@ -134,9 +134,11 @@ chromeman lock-resolutions
 sudo reboot
 ```
 
-This writes a fixed `Option "metamodes"` + `Virtual` canvas size into `/etc/X11/xorg.conf` (backing up the original first), tiling the configured outputs left-to-right at `y=0` in the order they appear in your config. After rebooting, those outputs will always come up at the resolution you specified — no more renegotiation when other monitors connect/disconnect.
+This writes a fixed `Option "metamodes"` + `Virtual` canvas size into `/etc/X11/xorg.conf` (backing up the original first), tiling the configured outputs left-to-right at `y=0` in the order they appear in your config. This raises the *ceiling* on the X virtual screen size so those resolutions are actually possible — without it, `xrandr` fails with `BadMatch` when trying to grow the screen.
 
 Only outputs with a `DISPLAY_N_MODE` set are included; outputs without one are left to X's normal auto-configuration. Re-run `chromeman lock-resolutions` (and reboot again) any time you add/remove a `DISPLAY_N_MODE` or change the layout.
+
+**Note:** on its own, `lock-resolutions` doesn't force the resolution to actually be applied — GNOME/mutter still resets outputs to their EDID-"preferred" mode on login. So `chromeman start` and the watchdog (`chromeman watch`) also run `xrandr` at startup to re-apply every `DISPLAY_N_MODE`, using the headroom `lock-resolutions` created. In other words: run `lock-resolutions` once (+ reboot) after changing `DISPLAY_N_MODE` values, and chromeman will keep re-applying them on every `start`/`restart`/watchdog launch after that.
 
 ---
 

@@ -41,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -172,6 +172,38 @@ validate_outputs() {
 }
 
 # =============================================================================
+# Apply DISPLAY_N_MODE resolutions via xrandr (tiled left-to-right at y=0,
+# same layout as `chromeman lock-resolutions`). Self-heals the case where
+# GNOME/mutter reset outputs to their EDID-preferred mode on login/reboot.
+# Requires the xorg.conf Virtual canvas from `chromeman lock-resolutions` to
+# be large enough, or this will fail with a RandR BadMatch.
+# =============================================================================
+
+apply_modes() {
+    local -a parts=()
+    local total_width=0
+    local i
+
+    for i in "${!OUTPUTS[@]}"; do
+        local mode="${MODES[$i]}"
+        [[ -n "$mode" ]] || continue
+        local w="${mode%x*}"
+        parts+=(--output "${OUTPUTS[$i]}" --mode "$mode" --pos "${total_width}x0")
+        total_width=$(( total_width + w ))
+    done
+
+    [[ ${#parts[@]} -gt 0 ]] || return 0
+
+    local err
+    if err=$(xrandr "${parts[@]}" 2>&1); then
+        log "Applied configured resolutions: xrandr ${parts[*]}"
+    else
+        warn "Failed to apply configured resolutions: $err"
+        warn "Run 'chromeman lock-resolutions' and reboot if this is a virtual-screen-size issue."
+    fi
+}
+
+# =============================================================================
 # Chrome process helpers
 # =============================================================================
 
@@ -287,6 +319,7 @@ cmd_start() {
     require_xrandr
     load_config
     validate_outputs
+    apply_modes
 
     info "Starting ${#OUTPUTS[@]} display(s)..."
     mkdir -p "$DEFAULT_CONFIG_DIR"
@@ -599,6 +632,7 @@ cmd_watch() {
     log "========================================"
 
     validate_outputs
+    apply_modes
 
     while true; do
         local count=${#OUTPUTS[@]}
