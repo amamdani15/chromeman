@@ -41,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -263,6 +263,8 @@ launch_one() {
         --no-default-browser-check
         --disable-session-crashed-bubble
         --disable-infobars
+        --disable-sync
+        --disable-background-networking
     )
     [[ -n "$geom" ]] && chrome_args+=(--window-position="${x},${y}" --window-size="${w},${h}")
     chrome_args+=("$url")
