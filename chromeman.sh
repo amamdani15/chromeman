@@ -14,6 +14,7 @@
 #   status              Show current state of all displays and watchdog
 #   watch               Run the watchdog in the foreground (used internally)
 #   outputs             List detected monitor outputs (via xrandr)
+#   connectors          List all video connectors, connected or not
 #   audio-sinks         List audio sinks for per-display audio routing
 #   install             Install as a systemd user service (auto-start on login)
 #   uninstall           Remove the systemd user service
@@ -468,6 +469,19 @@ cmd_outputs() {
     xrandr --listmonitors
     echo ""
     info "Use the name in the rightmost column (e.g. DP-7) as DISPLAY_N_OUTPUT in your config."
+}
+
+# =============================================================================
+# COMMAND: connectors — list all video connectors, connected or not
+# =============================================================================
+
+cmd_connectors() {
+    require_xrandr
+    info "All display connectors:"
+    echo ""
+    xrandr --query | grep -E "^[A-Za-z0-9-]+ (connected|disconnected)"
+    echo ""
+    info "Only 'connected' outputs can be used as DISPLAY_N_OUTPUT."
 }
 
 # =============================================================================
@@ -940,6 +954,7 @@ cmd_help() {
     status          Show running state of all displays and watchdog
     watch           Run watchdog in foreground (used internally by start)
     outputs         List detected monitor outputs (via xrandr)
+    connectors      List all video connectors, connected or not
     audio-sinks     List audio sinks for per-display audio routing
     http-server     Start HTTP API server for Companion integration
     install         Install watchdog as a systemd user service
@@ -1043,6 +1058,7 @@ case "$COMMAND" in
     status)         cmd_status ;;
     watch)          cmd_watch ;;
     outputs)        cmd_outputs ;;
+    connectors)     cmd_connectors ;;
     audio-sinks)    cmd_audio_sinks ;;
     http-server)    cmd_http_server ;;
     install)        cmd_install ;;
