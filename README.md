@@ -113,6 +113,31 @@ Output names are tied to the **physical GPU port** the cable is plugged into, no
 
 `chromeman start` and the watchdog (`chromeman watch`) automatically run a check on every cycle: if a configured output isn't currently detected by `xrandr`, a warning is printed/logged (`chromeman log`) naming the missing output and listing what's currently connected. That display will still attempt to launch, but without monitor-specific placement — keep an eye out for these warnings after any hardware change.
 
+### Forcing a resolution (`chromeman lock-resolutions`)
+
+Some monitors — especially ones behind converters/switchers (e.g. Blackmagic Design HDMI boxes) — report a misleading **EDID-"preferred" mode** (often `1920x1080`) even though they support 4K. X applies that preferred mode at every boot or hotplug, which can silently downgrade a display you'd manually set to 4K, and can also shrink the X virtual screen so other outputs can no longer be resized either.
+
+If you want specific outputs forced to a specific resolution regardless of what their EDID prefers, add a `DISPLAY_N_MODE` to your config:
+
+```ini
+DISPLAY_1_OUTPUT=DP-1
+DISPLAY_1_MODE=3840x2160
+...
+DISPLAY_2_OUTPUT=DP-3
+DISPLAY_2_MODE=3840x2160
+```
+
+Then run:
+
+```bash
+chromeman lock-resolutions
+sudo reboot
+```
+
+This writes a fixed `Option "metamodes"` + `Virtual` canvas size into `/etc/X11/xorg.conf` (backing up the original first), tiling the configured outputs left-to-right at `y=0` in the order they appear in your config. After rebooting, those outputs will always come up at the resolution you specified — no more renegotiation when other monitors connect/disconnect.
+
+Only outputs with a `DISPLAY_N_MODE` set are included; outputs without one are left to X's normal auto-configuration. Re-run `chromeman lock-resolutions` (and reboot again) any time you add/remove a `DISPLAY_N_MODE` or change the layout.
+
 ---
 
 ## Audio Routing
@@ -181,7 +206,9 @@ Leave `DISPLAY_N_AUDIO_SINK` blank/unset for any display that should just use th
 | `status` | Show the running state of every display and the watchdog |
 | `watch` | Run the watchdog loop in the foreground (used internally) |
 | `outputs` | List detected monitor outputs (via `xrandr`) |
+| `connectors` | List all video connectors, connected or not |
 | `audio-sinks` | List audio sinks for per-display audio routing |
+| `lock-resolutions` | Pin `DISPLAY_N_MODE` resolutions in `xorg.conf` (sudo, needs reboot) |
 | `http-server` | Start the HTTP API for Companion integration |
 | `install` | Register the watchdog as a systemd user service |
 | `install-http` | Register the HTTP server as a systemd user service |

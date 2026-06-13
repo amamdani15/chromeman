@@ -16,6 +16,7 @@
 #   outputs             List detected monitor outputs (via xrandr)
 #   connectors          List all video connectors, connected or not
 #   audio-sinks         List audio sinks for per-display audio routing
+#   lock-resolutions    Pin DISPLAY_N_MODE resolutions in xorg.conf (sudo, needs reboot)
 #   install             Install as a systemd user service (auto-start on login)
 #   uninstall           Remove the systemd user service
 #   log                 Tail the watchdog log
@@ -40,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -118,6 +119,7 @@ load_config() {
     URLS=()
     PROFILES=()
     AUDIO_SINKS=()
+    MODES=()
 
     require_config
 
@@ -126,17 +128,19 @@ load_config() {
     [[ -n "$max_n" ]] || die "No DISPLAY_* entries found in $CONFIG_FILE"
 
     for n in $(seq 1 "$max_n"); do
-        local out url prof sink
+        local out url prof sink mode
         out=$(grep  "^DISPLAY_${n}_OUTPUT="     "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
         url=$(grep  "^DISPLAY_${n}_URL="        "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
         prof=$(grep "^DISPLAY_${n}_PROFILE="    "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
         sink=$(grep "^DISPLAY_${n}_AUDIO_SINK=" "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
+        mode=$(grep "^DISPLAY_${n}_MODE="       "$CONFIG_FILE" | cut -d= -f2 | tr -d '[:space:]')
 
         if [[ -n "$out" && -n "$url" && -n "$prof" ]]; then
             OUTPUTS+=("$out")
             URLS+=("$url")
             PROFILES+=("$prof")
             AUDIO_SINKS+=("$sink")
+            MODES+=("$mode")
         fi
     done
 
@@ -502,6 +506,83 @@ cmd_audio_sinks() {
 }
 
 # =============================================================================
+# COMMAND: lock-resolutions — pin DISPLAY_N_MODE resolutions in xorg.conf
+# =============================================================================
+# Writes an "Option metamodes" + "Virtual" canvas into /etc/X11/xorg.conf so
+# the configured outputs always come up at the resolution you chose, instead
+# of falling back to each monitor's EDID-"preferred" mode at every boot or
+# hotplug. Outputs are tiled left-to-right at y=0 in config order.
+
+cmd_lock_resolutions() {
+    require_xrandr
+    load_config
+
+    local xorg_conf="/etc/X11/xorg.conf"
+    [[ -f "$xorg_conf" ]] || die "xorg.conf not found at $xorg_conf. Run 'sudo nvidia-xconfig' first to generate one."
+
+    local -a metamode_parts=()
+    local total_width=0
+    local max_height=0
+    local i
+
+    for i in "${!OUTPUTS[@]}"; do
+        local out="${OUTPUTS[$i]}"
+        local mode="${MODES[$i]}"
+        [[ -n "$mode" ]] || continue
+
+        [[ "$mode" =~ ^[0-9]+x[0-9]+$ ]] || die "Invalid DISPLAY_$((i+1))_MODE='$mode' — expected WIDTHxHEIGHT (e.g. 3840x2160)"
+
+        local w="${mode%x*}"
+        local h="${mode#*x}"
+
+        metamode_parts+=("${out}: ${mode} +${total_width}+0")
+        total_width=$(( total_width + w ))
+        (( h > max_height )) && max_height=$h
+    done
+
+    [[ ${#metamode_parts[@]} -gt 0 ]] || die "No DISPLAY_N_MODE values set in $CONFIG_FILE — nothing to pin. Add e.g. DISPLAY_1_MODE=3840x2160"
+
+    local metamodes_str
+    metamodes_str=$(printf '%s, ' "${metamode_parts[@]}")
+    metamodes_str="${metamodes_str%, }"
+
+    info "Computed layout (tiled left-to-right in config order):"
+    for i in "${!OUTPUTS[@]}"; do
+        [[ -n "${MODES[$i]}" ]] && echo "    Display $((i+1)): ${OUTPUTS[$i]} → ${MODES[$i]}"
+    done
+    echo ""
+    echo "    metamodes: $metamodes_str"
+    echo "    virtual:   ${total_width}x${max_height}"
+    echo ""
+    warn "This will modify $xorg_conf (sudo required) and needs a reboot to take effect."
+    read -rp "  Continue? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { info "Aborted. No changes made."; exit 0; }
+
+    local backup="${xorg_conf}.bak.$(date +%Y%m%d-%H%M%S)"
+    sudo cp "$xorg_conf" "$backup" || die "Failed to back up $xorg_conf"
+    ok "Backed up current config to $backup"
+
+    awk -v meta="$metamodes_str" -v virt="$total_width $max_height" '
+        /^[[:space:]]*Option[[:space:]]+"metamodes"/ { next }
+        /^[[:space:]]*Virtual[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ { next }
+        /DefaultDepth/ {
+            print
+            print "    Option         \"metamodes\" \"" meta "\""
+            next
+        }
+        /^[[:space:]]*Depth[[:space:]]+[0-9]+/ {
+            print
+            print "        Virtual     " virt
+            next
+        }
+        { print }
+    ' "$xorg_conf" | sudo tee "${xorg_conf}.new" > /dev/null && sudo mv "${xorg_conf}.new" "$xorg_conf"
+
+    ok "Updated $xorg_conf"
+    info "Reboot for this to take effect: sudo reboot"
+}
+
+# =============================================================================
 # COMMAND: watch (watchdog loop — called internally, or run directly)
 # =============================================================================
 
@@ -706,21 +787,26 @@ cmd_init() {
 # DISPLAY_N_PROFILE     = unique Chrome profile name (no spaces)
 # DISPLAY_N_AUDIO_SINK  = (optional) PulseAudio sink name for this display's audio
 #                         (run `chromeman audio-sinks` to list them)
+# DISPLAY_N_MODE        = (optional) WIDTHxHEIGHT to force via `chromeman lock-resolutions`
+#                         (use this if a monitor's EDID-preferred mode isn't the one you want)
 
 DISPLAY_1_OUTPUT=DP-7
 DISPLAY_1_URL=https://www.example.com
 DISPLAY_1_PROFILE=chrome-kiosk-1
 # DISPLAY_1_AUDIO_SINK=alsa_output.pci-0000_01_00.1.hdmi-stereo
+# DISPLAY_1_MODE=3840x2160
 
 DISPLAY_2_OUTPUT=DP-1
 DISPLAY_2_URL=https://www.example2.com
 DISPLAY_2_PROFILE=chrome-kiosk-2
 # DISPLAY_2_AUDIO_SINK=alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1
+# DISPLAY_2_MODE=3840x2160
 
 DISPLAY_3_OUTPUT=DP-3
 DISPLAY_3_URL=https://www.example3.com
 DISPLAY_3_PROFILE=chrome-kiosk-3
 # DISPLAY_3_AUDIO_SINK=alsa_output.pci-0000_01_00.1.hdmi-stereo-extra2
+# DISPLAY_3_MODE=3840x2160
 EOF
     ok "Config created: $CONFIG_FILE"
     info "Run 'chromeman outputs' to see your monitor names, then edit the config."
@@ -956,6 +1042,7 @@ cmd_help() {
     outputs         List detected monitor outputs (via xrandr)
     connectors      List all video connectors, connected or not
     audio-sinks     List audio sinks for per-display audio routing
+    lock-resolutions  Pin DISPLAY_N_MODE resolutions in xorg.conf (sudo, needs reboot)
     http-server     Start HTTP API server for Companion integration
     install         Install watchdog as a systemd user service
     install-http    Install HTTP server as a systemd user service
@@ -990,6 +1077,7 @@ cmd_help() {
   \033[1mEXAMPLES\033[0m
     chromeman outputs                           # list monitor names (e.g. DP-7)
     chromeman audio-sinks                       # list audio sinks for per-display audio
+    chromeman lock-resolutions                  # pin DISPLAY_N_MODE resolutions in xorg.conf
     chromeman init                              # create default config
     chromeman start                             # launch everything
     chromeman start -d 2 -u https://example.com # launch display 2 with custom URL
@@ -1060,6 +1148,7 @@ case "$COMMAND" in
     outputs)        cmd_outputs ;;
     connectors)     cmd_connectors ;;
     audio-sinks)    cmd_audio_sinks ;;
+    lock-resolutions) cmd_lock_resolutions ;;
     http-server)    cmd_http_server ;;
     install)        cmd_install ;;
     install-http)   cmd_install_http ;;
