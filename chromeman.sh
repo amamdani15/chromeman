@@ -41,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.5.5"
+VERSION="1.5.6"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -407,7 +407,7 @@ cmd_stop() {
         if [[ -z "$pids" ]]; then
             info "Display $dn ($out) not running."
         else
-            info "Closing display $dn ($out) (PIDs: $pids)..."
+            info "Closing display $dn ($out) (PIDs: $(echo "$pids" | tr '\n' ' '))..."
             kill $pids 2>/dev/null
         fi
     done
@@ -470,7 +470,7 @@ cmd_status() {
         local label="$dn ($out)"
 
         if [[ -n "$pids" ]]; then
-            printf "  \033[1;32m●\033[0m  Display %-10s  %-40s  PIDs: %s\n" "$label" "$url" "$pids"
+            printf "  \033[1;32m●\033[0m  Display %-10s  %-40s  PIDs: %s\n" "$label" "$url" "$(echo "$pids" | tr '\n' ' ')"
         elif is_paused "$prof"; then
             printf "  \033[1;33m⏸\033[0m  Display %-10s  %-40s  paused\n" "$label" "$url"
         else
@@ -687,7 +687,7 @@ cmd_pause() {
         local pids
         pids=$(get_pids "$prof")
         if [[ -n "$pids" ]]; then
-            info "Closing display $dn ($out) (PIDs: $pids)..."
+            info "Closing display $dn ($out) (PIDs: $(echo "$pids" | tr '\n' ' '))..."
             kill $pids 2>/dev/null
             sleep 3
             pids=$(get_pids "$prof")
