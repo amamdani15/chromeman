@@ -41,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.5.4"
+VERSION="1.5.5"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -280,7 +280,8 @@ launch_one() {
     log "$tag Chrome started (PID $chrome_pid)"
 
     # Wait for window then pin it to the correct monitor
-    for i in $(seq 1 20); do
+    local attempt
+    for attempt in $(seq 1 20); do
         sleep 0.5
         local win_id
         win_id=$(wmctrl -lp | awk -v pid="$chrome_pid" '$3 == pid { print $1; exit }')
