@@ -41,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.5.2"
+VERSION="1.5.3"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -271,9 +271,9 @@ launch_one() {
 
     if [[ -n "$audio_sink" ]]; then
         log "$tag Audio → $audio_sink"
-        PULSE_SINK="$audio_sink" google-chrome "${chrome_args[@]}" &
+        PULSE_SINK="$audio_sink" google-chrome "${chrome_args[@]}" >/dev/null 2>&1 &
     else
-        google-chrome "${chrome_args[@]}" &
+        google-chrome "${chrome_args[@]}" >/dev/null 2>&1 &
     fi
 
     local chrome_pid=$!
