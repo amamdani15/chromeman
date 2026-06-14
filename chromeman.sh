@@ -41,7 +41,7 @@
 #   chromeman log
 # =============================================================================
 
-VERSION="1.5.3"
+VERSION="1.5.4"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 DEFAULT_CONFIG_DIR="$HOME/chrome-manager"
 DEFAULT_CONFIG="$DEFAULT_CONFIG_DIR/chrome-displays.conf"
@@ -164,10 +164,10 @@ validate_outputs() {
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        warn "Configured output(s) not currently detected: ${missing[*]}"
-        warn "Connected outputs right now: $(echo "$connected" | tr '\n' ' ')"
-        warn "If a monitor was moved to a different port or is powered off, displays may launch on the wrong screen or without placement."
-        warn "Run 'chromeman outputs' to see current monitor names."
+        log "[WARN] Configured output(s) not currently detected: ${missing[*]}"
+        log "[WARN] Connected outputs right now: $(echo "$connected" | tr '\n' ' ')"
+        log "[WARN] If a monitor was moved to a different port or is powered off, displays may launch on the wrong screen or without placement."
+        log "[WARN] Run 'chromeman outputs' to see current monitor names."
     fi
 }
 
@@ -198,8 +198,8 @@ apply_modes() {
     if err=$(xrandr "${parts[@]}" 2>&1); then
         log "Applied configured resolutions: xrandr ${parts[*]}"
     else
-        warn "Failed to apply configured resolutions: $err"
-        warn "Run 'chromeman lock-resolutions' and reboot if this is a virtual-screen-size issue."
+        log "[WARN] Failed to apply configured resolutions: $err"
+        log "[WARN] Run 'chromeman lock-resolutions' and reboot if this is a virtual-screen-size issue."
     fi
 }
 
@@ -362,7 +362,7 @@ cmd_start() {
         else
             info "Starting watchdog (interval: ${INTERVAL}s)..."
             "$SCRIPT_PATH" watch --config "$CONFIG_FILE" --interval "$INTERVAL" \
-                >> "$LOG_FILE" 2>&1 &
+                > /dev/null 2>> "$LOG_FILE" &
             echo $! > "$PID_FILE"
             ok "Watchdog started (PID $!)."
         fi
@@ -971,7 +971,7 @@ print(p.get('url', [''])[0])
         if [[ -n "$cmd_args" && "$code" == "200" ]]; then
             log "[HTTP] $method $full_path → chromeman $cmd_args"
             export DISPLAY="${DISPLAY:-:0}"
-            bash -c "$SCRIPT_PATH $cmd_args --config '$CONFIG_FILE'" >> "$LOG_FILE" 2>&1 &
+            bash -c "$SCRIPT_PATH $cmd_args --config '$CONFIG_FILE'" > /dev/null 2>> "$LOG_FILE" &
         elif [[ "$code" != "204" ]]; then
             log "[HTTP] $method $full_path → $code $body"
         fi
