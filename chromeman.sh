@@ -652,6 +652,9 @@ cmd_watch() {
     load_config
     mkdir -p "$DEFAULT_CONFIG_DIR"
 
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"' EXIT
+
     log "========================================"
     log "chromeman watchdog started"
     log "Config:   $CONFIG_FILE"
