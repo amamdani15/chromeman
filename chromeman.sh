@@ -499,6 +499,30 @@ cmd_status() {
 }
 
 # =============================================================================
+# COMMAND: status-json — machine-readable status (used by http-server)
+# =============================================================================
+
+cmd_status_json() {
+    load_config
+
+    local json='{"displays":['
+    local count=${#OUTPUTS[@]}
+    local i
+    for (( i=0; i<count; i++ )); do
+        local state="stopped"
+        is_paused  "${PROFILES[$i]}" && state="paused"
+        is_running "${PROFILES[$i]}" && state="running"
+        [[ $i -gt 0 ]] && json+=","
+        json+="{\"display\":$(( i+1 )),\"output\":\"${OUTPUTS[$i]}\",\"url\":\"${URLS[$i]}\",\"state\":\"$state\"}"
+    done
+    json+="],"
+    watchdog_running && json+='"watchdog":"running"' || json+='"watchdog":"stopped"'
+    json+="}"
+
+    echo "$json"
+}
+
+# =============================================================================
 # COMMAND: outputs — list detected monitor outputs (via xrandr)
 # =============================================================================
 
@@ -852,7 +876,8 @@ EOF
 
 # =============================================================================
 # COMMAND: http-server
-# Tiny pure-bash HTTP server. Companion hits it to trigger chromeman actions.
+# Small HTTP server (embedded Python) that Companion hits to trigger
+# chromeman actions.
 #
 # Supported endpoints (GET):
 #   /restart              restart all displays
@@ -876,109 +901,116 @@ cmd_http_server() {
         exit 0
     fi
 
-    command -v nc &>/dev/null || die "netcat (nc) not found. Run: sudo apt install netcat-openbsd"
+    command -v python3 &>/dev/null || die "python3 not found."
 
-    echo $$ > "$HTTP_PID_FILE"
     log "[HTTP] chromeman HTTP server listening on port $port"
     log "[HTTP] Endpoints: GET /restart /start /stop /pause /resume /status"
     log "[HTTP] Params:    ?d=<display_number>  &url=<url-encoded-url>"
 
-    trap 'rm -f "$HTTP_PID_FILE"; log "[HTTP] Server stopped."' EXIT INT TERM
+    CHROMEMAN_PORT="$port" CHROMEMAN_SCRIPT="$SCRIPT_PATH" CHROMEMAN_CONFIG="$CONFIG_FILE" \
+        CHROMEMAN_LOG="$LOG_FILE" CHROMEMAN_DISPLAY="${DISPLAY:-:0}" \
+        python3 - <<'PYEOF' &
+import os, subprocess, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
-    while true; do
-        local raw
-        raw=$(nc -l -p "$port" -q 1 2>/dev/null)
+PORT    = int(os.environ["CHROMEMAN_PORT"])
+SCRIPT  = os.environ["CHROMEMAN_SCRIPT"]
+CONFIG  = os.environ["CHROMEMAN_CONFIG"]
+LOGFILE = os.environ["CHROMEMAN_LOG"]
+DISPLAY = os.environ.get("CHROMEMAN_DISPLAY", ":0")
 
-        # Parse first line: GET /path?query HTTP/1.1
-        local first_line method full_path path qs
-        first_line=$(echo "$raw" | head -1 | tr -d '\r')
-        method=$(echo "$first_line" | awk '{print $1}')
-        full_path=$(echo "$first_line" | awk '{print $2}')
-        path="${full_path%%\?*}"
-        qs=""
-        [[ "$full_path" == *"?"* ]] && qs="${full_path#*\?}"
+ACTIONS = {
+    "/restart": "restart",
+    "/start":   "start",
+    "/stop":    "stop",
+    "/pause":   "pause",
+    "/resume":  "resume",
+}
 
-        # Decode query params
-        local param_d param_url
-        param_d=$(echo "$qs" | grep -oP '(?:^|&)d=\K[^&]+')
-        param_url=""
-        if echo "$qs" | grep -q 'url='; then
-            param_url=$(python3 -c "
-import urllib.parse, sys
-qs = sys.argv[1]
-p = urllib.parse.parse_qs(qs)
-print(p.get('url', [''])[0])
-" "$qs" 2>/dev/null)
-        fi
+def log(msg):
+    line = "[%s] [HTTP] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        with open(LOGFILE, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
 
-        local cmd_args="" body="" code="200"
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
 
-        case "$path" in
-            /restart)
-                cmd_args="restart"
-                [[ -n "$param_d"   ]] && cmd_args+=" -d $param_d"
-                [[ -n "$param_url" ]] && cmd_args+=" -u $(printf '%q' "$param_url")"
-                body="OK: chromeman $cmd_args"
-                ;;
-            /start)
-                cmd_args="start"
-                [[ -n "$param_d"   ]] && cmd_args+=" -d $param_d"
-                [[ -n "$param_url" ]] && cmd_args+=" -u $(printf '%q' "$param_url")"
-                body="OK: chromeman $cmd_args"
-                ;;
-            /stop)
-                cmd_args="stop"
-                [[ -n "$param_d" ]] && cmd_args+=" -d $param_d"
-                body="OK: chromeman $cmd_args"
-                ;;
-            /pause)
-                [[ -z "$param_d" ]] && { code="400"; body="ERROR: ?d= required"; } || {
-                    cmd_args="pause -d $param_d"
-                    body="OK: chromeman $cmd_args"
-                }
-                ;;
-            /resume)
-                [[ -z "$param_d" ]] && { code="400"; body="ERROR: ?d= required"; } || {
-                    cmd_args="resume -d $param_d"
-                    [[ -n "$param_url" ]] && cmd_args+=" -u $(printf '%q' "$param_url")"
-                    body="OK: chromeman $cmd_args"
-                }
-                ;;
-            /status)
-                load_config 2>/dev/null
-                local json='{"displays":['
-                local count=${#OUTPUTS[@]}
-                for (( i=0; i<count; i++ )); do
-                    local state="stopped"
-                    is_paused  "${PROFILES[$i]}" && state="paused"
-                    is_running "${PROFILES[$i]}" && state="running"
-                    [[ $i -gt 0 ]] && json+=","
-                    json+="{\"display\":$(( i+1 )),\"output\":\"${OUTPUTS[$i]}\",\"url\":\"${URLS[$i]}\",\"state\":\"$state\"}"
-                done
-                json+="],"
-                watchdog_running && json+='"watchdog":"running"' || json+='"watchdog":"stopped"'
-                json+="}"
-                body="$json"
-                ;;
-            /favicon.ico) code="204"; body="" ;;
-            *)             code="404"; body="ERROR: unknown endpoint '$path'" ;;
-        esac
+    def _respond(self, code, body, content_type="text/plain"):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
-        # Send HTTP response
-        printf "HTTP/1.1 %s OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" \
-            "$code" "${#body}" "$body" | nc -l -p "$port" -q 1 2>/dev/null &
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        d = (qs.get("d") or [None])[0]
+        url = (qs.get("url") or [None])[0]
 
-        # Fire the chromeman command asynchronously
-        if [[ -n "$cmd_args" && "$code" == "200" ]]; then
-            log "[HTTP] $method $full_path → chromeman $cmd_args"
-            export DISPLAY="${DISPLAY:-:0}"
-            bash -c "$SCRIPT_PATH $cmd_args --config '$CONFIG_FILE'" > /dev/null 2>> "$LOG_FILE" &
-        elif [[ "$code" != "204" ]]; then
-            log "[HTTP] $method $full_path → $code $body"
-        fi
+        if path == "/favicon.ico":
+            self._respond(204, "")
+            return
 
-        wait 2>/dev/null
-    done
+        if path == "/status":
+            try:
+                out = subprocess.run(
+                    [SCRIPT, "status-json", "--config", CONFIG],
+                    capture_output=True, text=True, timeout=10, check=True)
+                self._respond(200, out.stdout.strip(), "application/json")
+            except Exception as exc:
+                self._respond(500, "ERROR: %s" % exc)
+                log("%s %s -> 500 %s" % (self.command, self.path, exc))
+            return
+
+        action = ACTIONS.get(path)
+        if action is None:
+            self._respond(404, "ERROR: unknown endpoint '%s'" % path)
+            log("%s %s -> 404 unknown endpoint" % (self.command, self.path))
+            return
+
+        if action in ("pause", "resume") and not d:
+            self._respond(400, "ERROR: ?d= required")
+            return
+
+        if d is not None and not d.isdigit():
+            self._respond(400, "ERROR: ?d= must be a number")
+            return
+
+        cmd_args = [action]
+        if d:
+            cmd_args += ["-d", d]
+        if url and action in ("restart", "start", "resume"):
+            cmd_args += ["-u", url]
+
+        self._respond(200, "OK: chromeman " + " ".join(cmd_args))
+        log("%s %s -> chromeman %s" % (self.command, self.path, " ".join(cmd_args)))
+
+        env = dict(os.environ)
+        env["DISPLAY"] = DISPLAY
+        with open(LOGFILE, "a") as logf:
+            subprocess.Popen(
+                [SCRIPT] + cmd_args + ["--config", CONFIG],
+                stdout=subprocess.DEVNULL, stderr=logf, env=env,
+                start_new_session=True)
+
+server = ThreadingHTTPServer(("", PORT), Handler)
+server.serve_forever()
+PYEOF
+
+    local pypid=$!
+    echo "$pypid" > "$HTTP_PID_FILE"
+
+    trap 'kill "$pypid" 2>/dev/null; rm -f "$HTTP_PID_FILE"; log "[HTTP] Server stopped."; exit 0' EXIT INT TERM
+
+    wait "$pypid"
 }
 
 # =============================================================================
@@ -1181,6 +1213,7 @@ case "$COMMAND" in
     pause)          cmd_pause ;;
     resume)         cmd_resume ;;
     status)         cmd_status ;;
+    status-json)    cmd_status_json ;;
     watch)          cmd_watch ;;
     outputs)        cmd_outputs ;;
     connectors)     cmd_connectors ;;

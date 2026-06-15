@@ -12,8 +12,7 @@ Features a built-in watchdog that checks every N minutes and relaunches any dead
 - `google-chrome` or `chromium-browser`
 - `wmctrl` — `sudo apt install wmctrl`
 - `xrandr` — `sudo apt install x11-xserver-utils` *(used to find/verify monitor outputs; usually preinstalled)*
-- `netcat-openbsd` — `sudo apt install netcat-openbsd` *(HTTP server only)*
-- `python3` *(standard on Ubuntu — used for URL decoding in HTTP server)*
+- `python3` *(standard on Ubuntu — runs the HTTP API server)*
 
 > **Important:** Window placement requires an **X11** session. At the Ubuntu login screen, click the gear icon and select **"Ubuntu on Xorg"** before logging in.
 
@@ -27,7 +26,7 @@ git clone https://github.com/yourname/chromeman.git
 cd chromeman
 
 # 2. Install dependencies
-sudo apt install wmctrl netcat-openbsd
+sudo apt install wmctrl
 
 # 3. Make the script executable
 chmod +x chromeman.sh
@@ -611,11 +610,17 @@ If a URL is broken or the page crashes Chrome on load, the watchdog will keep tr
 
 ### HTTP server not responding
 
-Check that `nc` is installed and is the OpenBSD variant (not traditional netcat):
+Check that `python3` is installed:
 
 ```bash
-sudo apt install netcat-openbsd
-nc --version   # should say "OpenBSD netcat"
+python3 --version
+```
+
+Check the service is actually running:
+
+```bash
+systemctl --user status chromeman-http
+journalctl --user -u chromeman-http -e
 ```
 
 Also verify the port isn't blocked by a firewall:
